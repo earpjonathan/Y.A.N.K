@@ -1,0 +1,1029 @@
+#!/usr/bin/env python3
+"""shuttle — stage NAS folders onto the dock SSD and push them back safely.
+
+Model: explicit pin / unpin, not a transparent cache. A real on-demand
+filesystem cache on macOS needs macFUSE (kernel extension, reduced security) or
+a File Provider extension; both are large and fragile. Explicit staging gives
+the same practical result for video work with none of that risk.
+
+The one invariant that matters: unpin never deletes local data until the copy
+on the NAS has been verified byte-for-byte present. Every deletion path in this
+file goes through verify_synced() first.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── paths ────────────────────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".config" / "shuttle"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_DIR = Path.home() / ".local" / "state" / "shuttle"
+MIRROR_MANIFEST = STATE_DIR / "manifest.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EJECTD = REPO_ROOT / "build" / "shuttle-ejectd"
+
+# Homebrew rsync 3.x. macOS ships openrsync (2.6.9-compatible), which lacks
+# --info=progress2, --partial-dir and -s/--protect-args. Those matter here.
+RSYNC_CANDIDATES = ["/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/usr/bin/rsync"]
+
+# Synology sprinkles these everywhere; copying them wastes time and space.
+EXCLUDES = ["@eaDir/", "#recycle/", "#snapshot/", ".DS_Store", "._*", "Thumbs.db"]
+
+DEFAULT_CONFIG = {
+    "volume": "Shuttle",
+    "cache_dir": "cache",
+    "link_dir": str(Path.home() / "Shuttle"),
+    "nas": {
+        "host": "nas.local",
+        "user": "",
+        "port": 22,
+        "ssh_key": str(Path.home() / ".ssh" / "nas_agent_ed25519"),
+        "roots": ["/volume1"],
+        # Measured on this DS220j (150 MB pulls): chacha20 8.4 MB/s, aes128-ctr
+        # 8.4, negotiated default 7.3, aes128-gcm 6.9, aes256-gcm 6.9. The AES-GCM
+        # modes are the SLOWEST here despite the ARMv8 crypto extensions, so do
+        # not "optimise" this back to AES without re-measuring.
+        # Empty string means "let ssh negotiate".
+        "cipher": "chacha20-poly1305@openssh.com",
+        "compress": False,
+    },
+    "eject": {
+        "on_lid_close": True,
+        # Clamshell mode (external display on AC) means the lid closing is the
+        # START of a work session, not the end. Don't eject then.
+        "skip_when_clamshell_active": True,
+        # In clamshell mode, unmount after this many minutes with no keyboard or
+        # mouse input, on the assumption you walked away. 0 disables it.
+        # Remounts automatically when input resumes.
+        "clamshell_idle_eject_minutes": 0,
+        "on_sleep": True,
+        "remount_on_lid_open": True,
+        "force": False,
+        "settle_seconds": 1,
+        "retry_seconds": 0,
+    },
+    "notify": {
+        "mac": True,
+        "phone": {
+            "provider": "ntfy",
+            "server": "https://ntfy.sh",
+            "topic": "",
+            "priority": "high",
+            "pushover_token": "",
+            "pushover_user": "",
+            "webhook_url": "",
+        },
+    },
+}
+
+# ── output helpers ───────────────────────────────────────────────────────────
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+
+
+def bold(s):  return _c("1", s)
+def red(s):   return _c("31", s)
+def green(s): return _c("32", s)
+def yellow(s):return _c("33", s)
+def blue(s):  return _c("36", s)
+def dim(s):   return _c("2", s)
+
+
+def die(msg: str, code: int = 1):
+    print(f"{red('error:')} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg: str):
+    print(f"{yellow('warning:')} {msg}", file=sys.stderr)
+
+
+def ok(msg: str):
+    print(f"{green('✓')} {msg}")
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return deep_merge(DEFAULT_CONFIG, json.loads(CONFIG_PATH.read_text()))
+        except json.JSONDecodeError as e:
+            die(f"config at {CONFIG_PATH} is not valid JSON: {e}")
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# ── volume + manifest ────────────────────────────────────────────────────────
+
+def volume_path(cfg) -> Path:
+    return Path("/Volumes") / cfg["volume"]
+
+
+def volume_mounted(cfg) -> bool:
+    return volume_path(cfg).is_dir()
+
+
+def cache_root(cfg) -> Path:
+    return volume_path(cfg) / cfg["cache_dir"]
+
+
+def manifest_path(cfg) -> Path:
+    return volume_path(cfg) / ".shuttle" / "manifest.json"
+
+
+def load_manifest(cfg) -> dict:
+    """The copy on the drive is authoritative — it travels with the disk. The
+    mirror in ~/.local/state only exists so `status` works when it is absent."""
+    p = manifest_path(cfg)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            warn(f"manifest at {p} is corrupt; falling back to local mirror")
+    if MIRROR_MANIFEST.exists():
+        try:
+            return json.loads(MIRROR_MANIFEST.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"version": 1, "entries": {}}
+
+
+def save_manifest(cfg, man: dict):
+    man["version"] = 1
+    blob = json.dumps(man, indent=2) + "\n"
+    if volume_mounted(cfg):
+        p = manifest_path(cfg)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(blob)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    MIRROR_MANIFEST.write_text(blob)
+
+
+# ── ssh / rsync plumbing ─────────────────────────────────────────────────────
+
+def find_rsync() -> str:
+    for c in RSYNC_CANDIDATES:
+        if Path(c).exists():
+            return c
+    die("no rsync found. Install one with:  brew install rsync")
+
+
+def rsync_is_modern(path: str) -> bool:
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True,
+                             timeout=10).stdout
+        first = out.splitlines()[0] if out else ""
+        if "openrsync" in out or "protocol version 29" in out:
+            return False
+        for tok in first.split():
+            if tok and tok[0].isdigit():
+                return int(tok.split(".")[0]) >= 3
+    except Exception:
+        pass
+    return False
+
+
+def ssh_base(cfg) -> list[str]:
+    n = cfg["nas"]
+    args = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15"]
+    if n.get("ssh_key"):
+        args += ["-i", os.path.expanduser(n["ssh_key"])]
+    if n.get("port") and int(n["port"]) != 22:
+        args += ["-p", str(n["port"])]
+    if n.get("cipher"):
+        args += ["-c", n["cipher"]]
+    if not n.get("compress"):
+        args += ["-o", "Compression=no"]
+    return args
+
+
+def require_nas_user(cfg):
+    if not cfg["nas"].get("user"):
+        die("no NAS username configured. Run:  shuttle setup")
+
+
+def remote_spec(cfg, path: str) -> str:
+    n = cfg["nas"]
+    return f"{n['user']}@{n['host']}:{path}"
+
+
+def ssh_run(cfg, remote_cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    require_nas_user(cfg)
+    n = cfg["nas"]
+    cmd = ssh_base(cfg) + [f"{n['user']}@{n['host']}", remote_cmd]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def check_remote_rsync(cfg) -> tuple[bool, str]:
+    """Confirm the NAS will actually serve rsync.
+
+    DSM ships /usr/bin/rsync as a setuid-root, Synology-patched binary that
+    refuses to serve unless "Enable rsync service" is ticked in
+    Control Panel > File Services > rsync. Without it the client sees a bare
+    "Permission denied, please try again." from the remote side, long after SSH
+    has already authenticated — which looks like an auth problem and is not one.
+    The real error underneath is "rsync service is no running (code 43)".
+
+    This probes with a genuine `rsync --list-only`, not a hand-rolled
+    `rsync --server` invocation: the flag string a real client sends differs
+    from anything we would construct by hand, and the Synology binary takes a
+    different path for it. Hand-rolling the server call reported failure while
+    real transfers were working perfectly.
+    """
+    root = (cfg["nas"].get("roots") or ["/volume1"])[0]
+    cmd = [find_rsync(), "--list-only", "-e", " ".join(ssh_base(cfg)),
+           remote_spec(cfg, root.rstrip("/") + "/")]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return False, "timed out probing remote rsync"
+    if proc.returncode == 0:
+        return True, "ok"
+    err = ((proc.stderr or "") + (proc.stdout or "")).strip()
+    low = err.lower()
+    if "code 43" in low or "service is no running" in low or "please try again" in low:
+        return False, ("the DSM rsync service is disabled — enable it in "
+                       "Control Panel > File Services > rsync")
+    if "command not found" in low:
+        return False, "no rsync binary on the NAS"
+    # Anything else means rsync answered, so the service is up. Once enabled,
+    # DSM maps SSH rsync paths onto shared-folder modules, and the volume root
+    # is not itself a module ("module is write only") — a real share path is
+    # fine. Only the signatures above indicate a service that cannot serve at
+    # all; every other failure belongs to the specific path and will surface
+    # with a precise error from the command the user actually ran.
+    return True, f"reachable (probe note: {err.splitlines()[0][:80]})"
+
+
+def check_nas(cfg, quiet: bool = False) -> bool:
+    try:
+        r = ssh_run(cfg, "echo shuttle-ok", timeout=15)
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            warn("NAS connection timed out")
+        return False
+    if r.returncode == 0 and "shuttle-ok" in r.stdout:
+        return True
+    if not quiet:
+        warn(f"NAS unreachable: {(r.stderr or r.stdout).strip()[:200]}")
+    return False
+
+
+def require_remote_rsync(cfg):
+    ok_, msg = check_remote_rsync(cfg)
+    if not ok_:
+        die(f"the NAS will not serve rsync: {msg}")
+
+
+def rsync_cmd(cfg, src: str, dst: str, *, dry: bool = False,
+              delete: bool = False, itemize: bool = False,
+              checksum: bool = False, progress: bool = True,
+              files_from: str | None = None) -> list[str]:
+    rs = find_rsync()
+    modern = rsync_is_modern(rs)
+    # -a minus owner/group: the external APFS volume is mounted `noowners`, so
+    # chown always fails there and would spam errors on every file.
+    args = [rs, "-rlptD", "--no-owner", "--no-group", "--human-readable"]
+    if modern:
+        # -s stops the remote shell from word-splitting paths that contain
+        # spaces, which most of this NAS's share names do.
+        args += ["-s", "--partial", "--partial-dir=.rsync-partial"]
+        if progress and not dry and _TTY:
+            # Only on a terminal: the carriage-return redraws are noise in a
+            # pipe or a log file.
+            args += ["--info=progress2"]
+    if dry:
+        args += ["--dry-run"]
+    if itemize:
+        args += ["--itemize-changes", "--out-format=%i %n"]
+    if checksum:
+        args += ["--checksum"]
+    if delete:
+        args += ["--delete"]
+    if files_from:
+        args += ["--files-from", files_from]
+    if cfg["nas"].get("compress"):
+        args += ["-z"]
+    for e in EXCLUDES:
+        args += ["--exclude", e]
+    args += ["-e", " ".join(ssh_base(cfg))]
+    args += [src, dst]
+    return args
+
+
+def run_rsync(cmd: list[str], stream: bool = True) -> tuple[int, str]:
+    if stream:
+        # rsync writes straight to our stdout. Without this flush, our own
+        # buffered prints land after the child's output and the log reads
+        # out of order.
+        sys.stdout.flush()
+        proc = subprocess.run(cmd)
+        sys.stdout.flush()
+        return proc.returncode, ""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+# ── core safety check ────────────────────────────────────────────────────────
+
+def files_modified_since(local: Path, since: float) -> list[str]:
+    """Paths (relative to `local`) touched at or after `since`."""
+    out = []
+    for root, dirs, names in os.walk(local, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if d not in ("@eaDir", "#recycle", ".rsync-partial")]
+        for n in names:
+            fp = Path(root) / n
+            try:
+                if fp.stat().st_mtime >= since:
+                    out.append(str(fp.relative_to(local)))
+            except OSError:
+                pass
+    return out
+
+
+def verify_synced(cfg, local: Path, remote: str, checksum: bool = False,
+                  since: float | None = None) -> tuple[bool, list[str]]:
+    """Confirm every local file is present and identical on the NAS.
+
+    Implemented as a dry-run rsync in the local -> remote direction: any file
+    rsync still wants to transfer is a file that is NOT safely on the NAS. An
+    empty transfer list is the only acceptable result before deleting anything.
+
+    Two-stage, because neither stage alone is both fast and sound:
+
+      1. Quick check (size + mtime) over everything. Cheap, but rsync's protocol
+         carries mtime as whole seconds, so a file rewritten to the SAME size
+         within the SAME second is invisible to it.
+
+      2. Checksum pass restricted to files modified since `since` (the moment
+         the push began). That is exactly the window where stage 1 can be
+         fooled, and it is normally a handful of files, so it costs little.
+
+    Passing checksum=True forces a full byte-for-byte pass over everything,
+    which is correct but reads every byte on both ends — hours for a large pin.
+    """
+    src = f"{local}/"
+    dst = remote_spec(cfg, remote.rstrip("/") + "/")
+    cmd = rsync_cmd(cfg, src, dst, dry=True, itemize=True,
+                    checksum=checksum, progress=False)
+    rc, out = run_rsync(cmd, stream=False)
+    if rc != 0:
+        return False, [f"rsync verification failed (exit {rc}): {out.strip()[:400]}"]
+    pending = parse_pending(out)
+    if pending:
+        return False, pending
+    if checksum or since is None:
+        return True, []
+
+    # Stage 2 — close the same-second, same-size blind spot.
+    recent = files_modified_since(local, since - 2)
+    if not recent:
+        return True, []
+    print(dim(f"  re-checking {len(recent)} recently-modified file(s) by checksum…"))
+    with tempfile.NamedTemporaryFile("w", suffix=".lst", delete=False) as fh:
+        fh.write("\n".join(recent) + "\n")
+        listfile = fh.name
+    try:
+        cmd = rsync_cmd(cfg, src, dst, dry=True, itemize=True, checksum=True,
+                        progress=False, files_from=listfile)
+        rc, out = run_rsync(cmd, stream=False)
+        if rc != 0:
+            return False, [f"checksum re-check failed (exit {rc}): {out.strip()[:400]}"]
+        return (not parse_pending(out)), parse_pending(out)
+    finally:
+        os.unlink(listfile)
+
+
+def parse_pending(out: str) -> list[str]:
+    """Extract real pending transfers from `rsync --itemize-changes` output.
+
+    Flag layout is YXcstpoguax, where Y is the update type:
+        <  sending to remote      >  receiving from remote
+        c  local change/creation  .  no update needed
+        *  message (e.g. deleting)
+    A leading '<' or '>' means rsync still wants to move file data — that file
+    is NOT safely on the NAS. 'cd' (creating a directory) and '.' entries are
+    benign; treating them as pending would make verification never pass.
+    """
+    pending = []
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line or " " not in line:
+            continue
+        flags, _, name = line.partition(" ")
+        if not name:
+            continue
+        if flags.startswith(("<", ">")):
+            pending.append(f"{flags} {name}")
+        elif flags.startswith("c") and not flags.startswith("cd"):
+            pending.append(f"{flags} {name}")
+        elif flags.startswith("*"):          # e.g. *deleting
+            pending.append(f"{flags} {name}")
+    return pending
+
+
+# ── directory stats ──────────────────────────────────────────────────────────
+
+def dir_stats(p: Path) -> tuple[int, int]:
+    total = files = 0
+    for root, dirs, names in os.walk(p, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if d not in ("@eaDir", "#recycle", ".rsync-partial")]
+        for n in names:
+            try:
+                total += (Path(root) / n).stat().st_size
+                files += 1
+            except OSError:
+                pass
+    return total, files
+
+
+def free_space(p: Path) -> int:
+    try:
+        st = os.statvfs(p)
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return 0
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_status(cfg, args):
+    man = load_manifest(cfg)
+    mounted = volume_mounted(cfg)
+
+    print(bold("Drive"))
+    if mounted:
+        vp = volume_path(cfg)
+        avail = free_space(vp)
+        print(f"  {cfg['volume']:<12} {green('mounted')}  {vp}")
+        print(f"  {'free':<12} {human(avail)}")
+    else:
+        print(f"  {cfg['volume']:<12} {yellow('not mounted')}")
+
+    print()
+    print(bold("Cached items"))
+    entries = man.get("entries", {})
+    if not entries:
+        print(dim("  (nothing pinned yet — try: shuttle pin '/volume1/Drone Footage/MyProject')"))
+    else:
+        print(f"  {'NAME':<24} {'SIZE':>10}  {'FILES':>7}  REMOTE")
+        for name, e in sorted(entries.items()):
+            local = Path(e["local"])
+            present = local.is_dir()
+            size = human(e.get("bytes", 0))
+            mark = green("●") if present else dim("○")
+            print(f"  {mark} {name:<22} {size:>10}  {e.get('files', 0):>7}  {dim(e['remote'])}")
+        print()
+        print(dim("  ● present on SSD    ○ recorded but missing (drive unplugged?)"))
+
+    print()
+    print(bold("Eject daemon"))
+    plist = Path.home() / "Library/LaunchAgents/com.shuttle.ejectd.plist"
+    if plist.exists():
+        r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        running = "com.shuttle.ejectd" in r.stdout
+        print(f"  installed, {green('running') if running else yellow('not running')}")
+    else:
+        print(f"  {yellow('not installed')} — run: shuttle daemon install")
+
+    ph = cfg["notify"]["phone"]
+    configured = bool(ph.get("topic") or ph.get("pushover_token") or ph.get("webhook_url"))
+    print(f"  phone alerts: {green(ph['provider']) if configured else yellow('not configured')}")
+
+
+def cmd_ls(cfg, args):
+    require_nas_user(cfg)
+    path = args.path or cfg["nas"]["roots"][0]
+    # Quoted for the remote shell; NAS share names contain spaces.
+    q = path.replace("'", "'\\''")
+    r = ssh_run(cfg, f"ls -la --time-style=long-iso '{q}' 2>/dev/null || ls -la '{q}'", timeout=30)
+    if r.returncode != 0:
+        die(f"cannot list {path}: {(r.stderr or '').strip()[:200]}")
+    for line in r.stdout.splitlines():
+        if any(x in line for x in ("@eaDir", "#recycle", "#snapshot")):
+            continue
+        print(line)
+
+
+def cmd_pin(cfg, args):
+    require_nas_user(cfg)
+    if not volume_mounted(cfg):
+        die(f"{cfg['volume']} is not mounted")
+    if not check_nas(cfg):
+        die("cannot reach the NAS")
+    require_remote_rsync(cfg)
+
+    remote = args.remote.rstrip("/")
+    name = args.name or Path(remote).name
+    if not name:
+        die("could not derive a name; pass --as NAME")
+
+    man = load_manifest(cfg)
+    if name in man["entries"] and not args.force:
+        die(f"'{name}' is already pinned. Use 'shuttle pull {name}' to refresh, "
+            f"or --force to re-pin.")
+
+    q = remote.replace("'", "'\\''")
+    r = ssh_run(cfg, f"test -d '{q}' && echo dir || (test -f '{q}' && echo file)", timeout=20)
+    kind = r.stdout.strip()
+    if kind not in ("dir", "file"):
+        die(f"remote path not found: {remote}")
+    if kind == "file":
+        die("pin operates on folders. Pass the containing folder instead.")
+
+    # Refuse to start a transfer that cannot possibly fit.
+    du = ssh_run(cfg, f"du -sk '{q}' 2>/dev/null | cut -f1", timeout=180)
+    try:
+        need = int(du.stdout.strip().split()[0]) * 1024
+    except (ValueError, IndexError):
+        need = 0
+    avail = free_space(volume_path(cfg))
+    if need:
+        print(f"  remote size: {human(need)}   free on {cfg['volume']}: {human(avail)}")
+        if need > avail * 0.95:
+            die(f"not enough space: need {human(need)}, have {human(avail)}")
+
+    dest = cache_root(cfg) / name
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"{blue('pulling')} {remote}\n     └─> {dest}")
+
+    cmd = rsync_cmd(cfg, remote_spec(cfg, remote + "/"), f"{dest}/", delete=args.mirror)
+    started = time.time()
+    rc, _ = run_rsync(cmd)
+    if rc != 0:
+        die(f"rsync failed (exit {rc}); local copy left in place at {dest}")
+
+    elapsed = max(time.time() - started, 0.001)
+    size, files = dir_stats(dest)
+    man["entries"][name] = {
+        "remote": remote,
+        "local": str(dest),
+        "pinned_at": now_iso(),
+        "last_pull": now_iso(),
+        "last_push": None,
+        "bytes": size,
+        "files": files,
+    }
+    save_manifest(cfg, man)
+    ensure_link(cfg, name)
+    ok(f"pinned '{name}' — {human(size)} in {files} files "
+       f"({human(size / elapsed)}/s)")
+    print(f"  local path: {dest}")
+    link = Path(cfg['link_dir']) / name
+    print(f"  stable path: {link}")
+
+
+def cmd_pull(cfg, args):
+    require_nas_user(cfg)
+    man = load_manifest(cfg)
+    e = man["entries"].get(args.name) or die(f"'{args.name}' is not pinned")
+    if not volume_mounted(cfg):
+        die(f"{cfg['volume']} is not mounted")
+    if not check_nas(cfg):
+        die("cannot reach the NAS")
+    require_remote_rsync(cfg)
+
+    dest = Path(e["local"])
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"{blue('pulling')} {e['remote']} -> {dest}")
+    cmd = rsync_cmd(cfg, remote_spec(cfg, e["remote"] + "/"), f"{dest}/", delete=args.mirror)
+    rc, _ = run_rsync(cmd)
+    if rc != 0:
+        die(f"rsync failed (exit {rc})")
+    e["bytes"], e["files"] = dir_stats(dest)
+    e["last_pull"] = now_iso()
+    save_manifest(cfg, man)
+    ok(f"refreshed '{args.name}' — {human(e['bytes'])} in {e['files']} files")
+
+
+def _push(cfg, man, name, delete: bool) -> dict:
+    e = man["entries"].get(name) or die(f"'{name}' is not pinned")
+    local = Path(e["local"])
+    if not local.is_dir():
+        die(f"local copy missing at {local}")
+    if not check_nas(cfg):
+        die("cannot reach the NAS")
+    require_remote_rsync(cfg)
+
+    print(f"{blue('pushing')} {local} -> {e['remote']}")
+    cmd = rsync_cmd(cfg, f"{local}/", remote_spec(cfg, e["remote"] + "/"), delete=delete)
+    rc, _ = run_rsync(cmd)
+    if rc != 0:
+        die(f"rsync failed (exit {rc}); nothing was deleted locally")
+    e["last_push"] = now_iso()
+    e["bytes"], e["files"] = dir_stats(local)
+    save_manifest(cfg, man)
+    return e
+
+
+def cmd_push(cfg, args):
+    require_nas_user(cfg)
+    man = load_manifest(cfg)
+    _push(cfg, man, args.name, delete=args.mirror)
+    ok(f"pushed '{args.name}' to the NAS (local copy kept)")
+
+
+def cmd_unpin(cfg, args):
+    require_nas_user(cfg)
+    man = load_manifest(cfg)
+    name = args.name
+    e = man["entries"].get(name) or die(f"'{name}' is not pinned")
+    local = Path(e["local"])
+
+    if not local.is_dir():
+        if args.forget:
+            del man["entries"][name]
+            save_manifest(cfg, man)
+            ok(f"forgot '{name}' (local copy was already gone)")
+            return
+        die(f"local copy missing at {local}. Use --forget to drop the record.")
+
+    # 1. push
+    push_started = time.time()
+    if not args.no_push:
+        _push(cfg, man, name, delete=args.mirror)
+    else:
+        warn("--no-push: skipping upload, verifying what is already on the NAS")
+
+    # 2. verify — the gate that protects against data loss
+    print(f"{blue('verifying')} every local file is present on the NAS…")
+    if args.checksum:
+        print(dim("  (checksum mode: reads every byte on both ends, this is slow)"))
+    good, pending = verify_synced(cfg, local, e["remote"],
+                                  checksum=args.checksum, since=push_started)
+    if not good:
+        print(red(f"\n  VERIFICATION FAILED — {len(pending)} item(s) not safely on the NAS:"))
+        for p in pending[:20]:
+            print(f"    {p}")
+        if len(pending) > 20:
+            print(f"    … and {len(pending) - 20} more")
+        die("refusing to delete anything. Local copy is untouched.")
+    ok("verified — every local file is on the NAS")
+
+    # 3. only now delete
+    size = e.get("bytes", 0)
+    if not args.yes:
+        resp = input(f"\nDelete local copy at {local} ({human(size)})? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("aborted; local copy kept")
+            return
+    shutil.rmtree(local)
+    link = Path(cfg["link_dir"]) / name
+    if link.is_symlink():
+        link.unlink()
+    del man["entries"][name]
+    save_manifest(cfg, man)
+    ok(f"unpinned '{name}' — freed {human(size)}")
+
+
+def ensure_link(cfg, name: str):
+    """Stable path under ~/Shuttle so editors keep resolving project media even
+    though the real files live on /Volumes/<vol>/cache."""
+    link_dir = Path(cfg["link_dir"])
+    link_dir.mkdir(parents=True, exist_ok=True)
+    link = link_dir / name
+    target = cache_root(cfg) / name
+    if link.is_symlink():
+        if link.resolve(strict=False) == target:
+            return
+        link.unlink()
+    elif link.exists():
+        warn(f"{link} exists and is not a symlink; leaving it alone")
+        return
+    link.symlink_to(target)
+
+
+def cmd_eject(cfg, args):
+    if not EJECTD.exists():
+        die(f"daemon binary not built. Run: {REPO_ROOT}/install.sh")
+    subprocess.run([str(EJECTD), "--eject-now"])
+
+
+def cmd_mount(cfg, args):
+    if not EJECTD.exists():
+        die(f"daemon binary not built. Run: {REPO_ROOT}/install.sh")
+    r = subprocess.run([str(EJECTD), "--remount-now"])
+    if r.returncode != 0:
+        die(f"could not mount {cfg['volume']} — is the dock connected?")
+    ok(f"{cfg['volume']} mounted at {volume_path(cfg)}")
+
+
+def cmd_doctor(cfg, args):
+    print(bold("shuttle doctor\n"))
+
+    print(bold("Drive"))
+    if volume_mounted(cfg):
+        vp = volume_path(cfg)
+        r = subprocess.run(["diskutil", "info", "-plist", str(vp)],
+                           capture_output=True)
+        fs = "?"
+        try:
+            info = plistlib.loads(r.stdout)
+            fs = info.get("FilesystemName") or info.get("FilesystemType") or "?"
+            print(f"  {green('mounted')}  {vp}  ({fs}, {human(free_space(vp))} free)")
+        except Exception:
+            print(f"  {green('mounted')}  {vp}")
+        if fs and "ntfs" in str(fs).lower():
+            warn("NTFS cannot preserve POSIX metadata; APFS is strongly preferred")
+    else:
+        print(f"  {yellow('not mounted')}")
+
+    print()
+    print(bold("USB link speed"))
+    r = subprocess.run(["ioreg", "-p", "IOUSB", "-w0", "-l"],
+                       capture_output=True, text=True)
+    speeds = [l for l in r.stdout.splitlines() if "Device Speed" in l]
+    superspeed = sum(1 for l in speeds if any(f"= {n}" in l for n in (3, 4, 5)))
+    if speeds and superspeed == 0:
+        print(f"  {red('USB 2.0 only')} — every device enumerates at High Speed (480 Mb/s).")
+        print(f"  {dim('Expect ~40 MB/s. A USB 3.2 cable should give 450-1000 MB/s.')}")
+        print(f"  {dim('Most likely cause: a USB-C cable that carries only USB 2.0 pairs.')}")
+    elif superspeed:
+        print(f"  {green('SuperSpeed present')} — {superspeed} device(s) at 5 Gb/s or better")
+    else:
+        print(f"  {dim('no USB devices found (dock unplugged?)')}")
+
+    print()
+    print(bold("rsync"))
+    rs = find_rsync()
+    modern = rsync_is_modern(rs)
+    print(f"  {rs} — {green('3.x') if modern else yellow('openrsync (limited)')}")
+    if not modern:
+        warn("install a modern rsync for resume + progress:  brew install rsync")
+
+    print()
+    print(bold("NAS"))
+    n = cfg["nas"]
+    if not n.get("user"):
+        print(f"  {yellow('no username configured')} — run: shuttle setup")
+    else:
+        print(f"  {n['user']}@{n['host']}:{n['port']}")
+        t0 = time.time()
+        reachable = check_nas(cfg, quiet=True)
+        if reachable:
+            print(f"  {green('reachable')} (handshake {time.time() - t0:.1f}s)")
+            rs_ok, rs_msg = check_remote_rsync(cfg)
+            if rs_ok:
+                print(f"  remote rsync: {green('available')}")
+            else:
+                print(f"  remote rsync: {red('unavailable')} — {rs_msg}")
+                print(dim("  pin/pull/push/unpin cannot work until this is fixed."))
+            if args.bench:
+                print(dim("  benchmarking 100 MB read from NAS…"))
+                mb = 100
+                t0 = time.time()
+                # Discard to /dev/null rather than capture_output: buffering the
+                # whole stream into Python measured ~3 MB/s against a real 8.4.
+                with open(os.devnull, "wb") as null:
+                    p = subprocess.run(
+                        ssh_base(cfg) + [f"{n['user']}@{n['host']}",
+                                         f"dd if=/dev/zero bs=1M count={mb} 2>/dev/null"],
+                        stdout=null, stderr=subprocess.DEVNULL)
+                el = time.time() - t0
+                if p.returncode == 0 and el > 0:
+                    print(f"  throughput: {bold(human(mb * 1024 * 1024 / el) + '/s')}")
+        else:
+            print(f"  {red('unreachable')}")
+
+    print()
+    print(bold("Phone notifications"))
+    ph = cfg["notify"]["phone"]
+    if ph["provider"] == "ntfy" and ph.get("topic"):
+        print(f"  ntfy — {ph['server']}/{ph['topic']}")
+        print(dim("  test with: shuttle notify-test"))
+    elif ph.get("pushover_token") or ph.get("webhook_url"):
+        print(f"  {ph['provider']} configured")
+    else:
+        print(f"  {yellow('not configured')} — run: shuttle setup")
+
+
+def cmd_notify_test(cfg, args):
+    if not EJECTD.exists():
+        die(f"daemon binary not built. Run: {REPO_ROOT}/install.sh")
+    subprocess.run([str(EJECTD), "--test-notify"])
+
+
+def cmd_setup(cfg, args):
+    print(bold("shuttle setup\n"))
+
+    print(bold("1. NAS over SSH"))
+    n = cfg["nas"]
+    host = input(f"   host [{n['host']}]: ").strip() or n["host"]
+    cur_user = n.get("user", "")
+    user_prompt = f"   username [{cur_user}]: " if cur_user else "   username: "
+    user = input(user_prompt).strip() or cur_user
+    port = input(f"   port [{n['port']}]: ").strip() or str(n["port"])
+    key = input(f"   ssh key [{n['ssh_key']}]: ").strip() or n["ssh_key"]
+    cfg["nas"].update({"host": host, "user": user, "port": int(port), "ssh_key": key})
+
+    if user:
+        print(dim("   testing…"))
+        if check_nas(cfg, quiet=True):
+            ok("   NAS reachable")
+        else:
+            warn("   could not connect. On the NAS, make sure SSH is enabled "
+                 "(Control Panel > Terminal & SNMP) and that this key is in "
+                 f"~/.ssh/authorized_keys for '{user}'.")
+            print(dim(f"   public key: {key}.pub"))
+
+    print()
+    print(bold("2. Phone notifications"))
+    print(dim("   Used when the SSD cannot be ejected because files are open —"))
+    print(dim("   you will not see a Mac notification behind a closed lid."))
+    ph = cfg["notify"]["phone"]
+    prov = input(f"   provider (ntfy/pushover/webhook/none) [{ph['provider']}]: ").strip() \
+        or ph["provider"]
+    ph["provider"] = prov
+    if prov == "ntfy":
+        print(dim("   Install the 'ntfy' app, then subscribe to the topic you pick here."))
+        print(dim("   Anyone who guesses the topic can read it, so make it long and random."))
+        suggested = ph.get("topic") or f"shuttle-{os.urandom(6).hex()}"
+        topic = input(f"   topic [{suggested}]: ").strip() or suggested
+        ph["topic"] = topic
+        print(f"   subscribe in the app to: {bold(topic)}")
+    elif prov == "pushover":
+        ph["pushover_token"] = input("   app token: ").strip() or ph["pushover_token"]
+        ph["pushover_user"] = input("   user key: ").strip() or ph["pushover_user"]
+    elif prov == "webhook":
+        ph["webhook_url"] = input("   webhook URL: ").strip() or ph["webhook_url"]
+
+    save_config(cfg)
+    print()
+    ok(f"saved {CONFIG_PATH}")
+    print(dim("   send a test with: shuttle notify-test"))
+
+
+def cmd_config(cfg, args):
+    if args.init:
+        if CONFIG_PATH.exists():
+            print(f"config already exists: {CONFIG_PATH}")
+        else:
+            save_config(DEFAULT_CONFIG)
+            ok(f"wrote default config: {CONFIG_PATH}")
+        return
+    if args.path:
+        print(CONFIG_PATH)
+        return
+    print(json.dumps(cfg, indent=2))
+
+
+def cmd_daemon(cfg, args):
+    label = "com.shuttle.ejectd"
+    plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+
+    if args.action == "status":
+        subprocess.run([str(EJECTD), "--status"])
+        r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        print(f"launchd: {'loaded' if label in r.stdout else 'not loaded'}")
+    elif args.action == "log":
+        logp = Path.home() / "Library/Logs/shuttle-ejectd.log"
+        if logp.exists():
+            subprocess.run(["tail", "-n", str(args.lines), str(logp)])
+        else:
+            print(f"no log yet at {logp}")
+    elif args.action == "restart":
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        subprocess.run(["launchctl", "load", str(plist)])
+        ok("restarted")
+    elif args.action in ("install", "uninstall"):
+        die(f"run {REPO_ROOT}/install.sh (or uninstall.sh) for this")
+
+
+# ── argument parsing ─────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="shuttle",
+        description="Stage NAS folders onto the dock SSD, and eject it safely.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="what is cached and how the system looks")
+
+    s = sub.add_parser("ls", help="browse the NAS")
+    s.add_argument("path", nargs="?")
+
+    s = sub.add_parser("pin", help="copy a NAS folder onto the SSD")
+    s.add_argument("remote")
+    s.add_argument("--as", dest="name", help="local name (default: folder name)")
+    s.add_argument("--mirror", action="store_true",
+                   help="delete local files absent from the NAS")
+    s.add_argument("--force", action="store_true", help="re-pin if already pinned")
+
+    s = sub.add_parser("pull", help="refresh a pinned folder from the NAS")
+    s.add_argument("name")
+    s.add_argument("--mirror", action="store_true")
+
+    s = sub.add_parser("push", help="send local changes to the NAS, keep local copy")
+    s.add_argument("name")
+    s.add_argument("--mirror", action="store_true",
+                   help="delete NAS files absent locally")
+
+    s = sub.add_parser("unpin", help="push, verify, then remove the local copy")
+    s.add_argument("name")
+    s.add_argument("--yes", "-y", action="store_true", help="skip the confirmation")
+    s.add_argument("--mirror", action="store_true")
+    s.add_argument("--no-push", action="store_true",
+                   help="do not upload first; only verify what is already there")
+    s.add_argument("--checksum", action="store_true",
+                   help="verify by reading every byte (slow, paranoid)")
+    s.add_argument("--forget", action="store_true",
+                   help="drop the record when the local copy is already gone")
+
+    sub.add_parser("eject", help="unmount the SSD now")
+    sub.add_parser("mount", help="mount the SSD again without replugging")
+    sub.add_parser("setup", help="configure NAS access and phone alerts")
+    sub.add_parser("notify-test", help="send a test notification")
+
+    s = sub.add_parser("doctor", help="diagnose the whole setup")
+    s.add_argument("--bench", action="store_true", help="also measure NAS throughput")
+
+    s = sub.add_parser("config", help="show or initialise configuration")
+    s.add_argument("--init", action="store_true", help="write defaults if absent")
+    s.add_argument("--path", action="store_true", help="print the config file path")
+
+    s = sub.add_parser("daemon", help="manage the eject daemon")
+    s.add_argument("action", choices=["status", "log", "restart", "install", "uninstall"])
+    s.add_argument("--lines", type=int, default=40)
+
+    args, extra = p.parse_known_args()
+
+    # NAS share names are full of spaces ("Drone Footage", "mosaic 6_25"), so an
+    # unquoted path is the single easiest mistake to make here. The shell splits
+    # it into several argv entries and argparse's own message ("unrecognized
+    # arguments") gives no hint about the real cause. Reconstruct it and show
+    # the exact command that would have worked.
+    if extra:
+        if not any(e.startswith("-") for e in extra) and getattr(args, "remote", None):
+            joined = " ".join([args.remote] + extra)
+            die("that path was split by the shell because it contains spaces.\n"
+                f"  Wrap it in quotes:\n\n"
+                f"    shuttle {args.cmd} \"{joined}\"\n")
+        elif not any(e.startswith("-") for e in extra) and getattr(args, "path", None):
+            joined = " ".join([args.path] + extra)
+            die("that path was split by the shell because it contains spaces.\n"
+                f"  Wrap it in quotes:\n\n"
+                f"    shuttle {args.cmd} \"{joined}\"\n")
+        die(f"unrecognized arguments: {' '.join(extra)}")
+
+    cfg = load_config()
+
+    handlers = {
+        "status": cmd_status, "ls": cmd_ls, "pin": cmd_pin, "pull": cmd_pull,
+        "push": cmd_push, "unpin": cmd_unpin, "eject": cmd_eject,
+        "mount": cmd_mount,
+        "doctor": cmd_doctor, "setup": cmd_setup, "notify-test": cmd_notify_test,
+        "daemon": cmd_daemon, "config": cmd_config,
+    }
+    try:
+        handlers[args.cmd](cfg, args)
+    except KeyboardInterrupt:
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

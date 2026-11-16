@@ -1,0 +1,18 @@
+# Everything is ignored by default and only source and docs are let back in.
+# The built daemon (build/) and any local config stay out. To track a new
+# top-level file or folder, add a "!" line for it below.
+/*
+
+!/.gitignore
+!/README.md
+!/LICENSE
+!/install.sh
+!/uninstall.sh
+!/bin/
+!/src/
+!/launchd/
+!/tests/
+
+__pycache__/
+*.pyc
+.DS_Store
